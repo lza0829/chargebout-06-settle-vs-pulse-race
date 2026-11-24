@@ -2,7 +2,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.db import db
-from app.services import core
+from app.services import contention, core
 from app.services import sessions as svc
 
 router = APIRouter()
@@ -34,6 +34,7 @@ def get_session(session_id: int):
         d = core.session_detail(conn, session_id)
         if not d:
             raise HTTPException(404, detail="会话不存在")
+        d["重放核对"] = contention.replay_session(conn, session_id)
         return d
 
 
@@ -45,14 +46,49 @@ def open_session(body: OpenIn):
 
 @router.post("/会话/{session_id}/脉冲")
 def add_pulse(session_id: int, body: PulseIn):
-    with db() as conn:
-        return svc.add_pulse(conn, session_id, body.电量, body.功率)
+    # 自管连接的两段式争用协议（登记→落账），不与外层 db() 事务混用
+    return svc.add_pulse(session_id, body.电量, body.功率)
 
 
 @router.post("/会话/{session_id}/结算")
 def settle(session_id: int):
+    # 自管连接的两段式关账（屏障→收口→临界提交）
+    return svc.settle(session_id)
+
+
+@router.get("/会话/{session_id}/在途")
+def inflight(session_id: int):
     with db() as conn:
-        return svc.settle(conn, session_id)
+        if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+            raise HTTPException(404, detail="会话不存在")
+        return core.list_inflight(conn, session_id)
+
+
+@router.get("/会话/{session_id}/争用快照")
+def journal(session_id: int):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+            raise HTTPException(404, detail="会话不存在")
+        return core.list_journal(conn, session_id)
+
+
+@router.get("/会话/{session_id}/重放")
+def replay(session_id: int):
+    with db() as conn:
+        r = contention.replay_session(conn, session_id)
+        if r is None:
+            raise HTTPException(404, detail="会话不存在")
+        # 标记快照已被重放（审计），不改变业务真值
+        conn.execute(
+            "UPDATE contention_journal SET replayed_at=? WHERE session_id=? AND replayed_at IS NULL",
+            (core.now_str(), session_id),
+        )
+        return r
+
+
+@router.post("/会话/{session_id}/修复")
+def repair(session_id: int):
+    return contention.repair_session(session_id)
 
 
 @router.post("/会话/{session_id}/超时")

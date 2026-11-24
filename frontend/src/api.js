@@ -29,6 +29,9 @@ export const api = {
   开会话: (body) => req('/开会话', { method: 'POST', body: JSON.stringify(body) }),
   脉冲: (id, body) => req(`/会话/${id}/脉冲`, { method: 'POST', body: JSON.stringify(body) }),
   结算: (id) => req(`/会话/${id}/结算`, { method: 'POST', body: '{}' }),
+  在途: (id) => req(`/会话/${id}/在途`),
+  重放: (id) => req(`/会话/${id}/重放`),
+  修复: (id) => req(`/会话/${id}/修复`, { method: 'POST', body: '{}' }),
   超时: (id) => req(`/会话/${id}/超时`, { method: 'POST', body: '{}' }),
   中断: (id, 原因 = '急停') =>
     req(`/会话/${id}/中断`, { method: 'POST', body: JSON.stringify({ 原因 }) }),

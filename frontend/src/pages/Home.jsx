@@ -25,12 +25,15 @@ export default function Home() {
     ['已中断', o.已中断],
     ['在充电量', o.在充电量],
     ['本日关账金额', o.本日关账金额],
+    ['在途脉冲数', o.在途脉冲数],
+    ['在途脉冲电量', o.在途脉冲电量],
+    ['结算中带在途会话数', o.结算中带在途会话数],
   ]
   return (
     <div className="page">
       <h2>总览</h2>
       <p className="lead">
-        营业日 {o.营业日} · 充日{o.充日已封印 ? '已封印' : '未封印'}
+        营业日 {o.营业日} · 充日{o.充日已封印 ? '已封印' : '未封印'} · 争用口径：{o.争用口径}
       </p>
       <div className="grid">
         {items.map(([k, v]) => (
@@ -40,6 +43,9 @@ export default function Home() {
           </div>
         ))}
       </div>
+      {o.在途脉冲数 > 0 && (
+        <p className="msg">当前有 {o.在途脉冲数} 笔在途脉冲未收口，关账完成前不会假装零在途。</p>
+      )}
       <button type="button" onClick={load}>刷新</button>
       <p className="msg">{err}</p>
     </div>

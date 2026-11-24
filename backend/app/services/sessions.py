@@ -1,6 +1,8 @@
 from __future__ import annotations
 from fastapi import HTTPException
 
+from app.db import connect, immediate_tx
+from app.services import contention
 from app.services.core import current_band_price, get_setting, is_day_sealed, now_str, today
 
 
@@ -70,92 +72,63 @@ def open_session(conn, pile_id: int, gun_id: int | None = None) -> dict:
     return {"会话号": slip, "会话编号": sid, "锁定电价": price, "状态": "充电中"}
 
 
-def add_pulse(conn, session_id: int, delta_kwh: float, power_kw: float = 0) -> dict:
-    if delta_kwh <= 0:
-        raise HTTPException(400, detail="脉冲电量须大于零")
-    se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-    if not se:
-        raise HTTPException(404, detail="会话不存在")
-    if se["status"] != "充电中":
-        raise HTTPException(400, detail=f"会话状态为{se['status']}，不可记脉冲")
-    ts = now_str()
-    conn.execute(
-        "INSERT INTO pulses(session_id,delta_kwh,power_kw,created_at) VALUES(?,?,?,?)",
-        (session_id, delta_kwh, power_kw, ts),
-    )
-    new_kwh = float(se["kwh"]) + float(delta_kwh)
-    price = float(se["price_locked"] or current_band_price(conn, se["rate_plan_id"]))
-    amount = round(new_kwh * price, 2)
-    conn.execute(
-        "UPDATE sessions SET kwh=?, amount=? WHERE id=?",
-        (round(new_kwh, 3), amount, session_id),
-    )
-    conn.execute(
-        "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
-        (session_id, "脉冲", ts, f"+{delta_kwh}"),
-    )
-    return {"会话编号": session_id, "累计电量": round(new_kwh, 3), "预估金额": amount}
+def add_pulse(session_id: int, delta_kwh: float, power_kw: float = 0) -> dict:
+    # 口径B：在途脉冲优先。登记→落账两段式，全部串行化与重放逻辑在 contention 内。
+    return contention.record_pulse(session_id, delta_kwh, power_kw)
 
 
-def settle(conn, session_id: int) -> dict:
-    se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-    if not se:
-        raise HTTPException(404, detail="会话不存在")
-    if se["status"] not in ("充电中", "结算中", "已超时"):
-        raise HTTPException(400, detail=f"会话状态为{se['status']}，不可关账")
-    ts = now_str()
-    price = float(se["price_locked"] or current_band_price(conn, se["rate_plan_id"]))
-    amount = round(float(se["kwh"]) * price, 2)
-    conn.execute(
-        "UPDATE sessions SET status='已关账', amount=?, closed_at=?, price_locked=? WHERE id=?",
-        (amount, ts, price, session_id),
-    )
-    conn.execute("UPDATE piles SET status='空闲' WHERE id=?", (se["pile_id"],))
-    conn.execute("UPDATE guns SET status='可用' WHERE id=?", (se["gun_id"],))
-    conn.execute(
-        "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
-        (session_id, "结算关账", ts, f"金额{amount}"),
-    )
-    return {"会话编号": session_id, "电量": float(se["kwh"]), "金额": amount, "状态": "已关账"}
+def settle(session_id: int) -> dict:
+    # 口径B：关账让在途脉冲先收口。屏障→等收口→临界提交，无半截、可重放。
+    return contention.settle(session_id)
 
 
 def mark_timeout(conn, session_id: int) -> dict:
-    se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-    if not se:
-        raise HTTPException(404, detail="会话不存在")
-    if se["status"] != "充电中":
-        raise HTTPException(400, detail=f"会话状态为{se['status']}，不可标超时")
-    minutes = int(get_setting(conn, "超时分钟", "120"))
-    ts = now_str()
-    conn.execute(
-        "UPDATE sessions SET status='已超时', note=? WHERE id=?",
-        (f"超过{minutes}分钟未关", session_id),
-    )
-    conn.execute(
-        "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
-        (session_id, "超时", ts, f"阈值{minutes}分钟"),
-    )
-    return {"会话编号": session_id, "状态": "已超时"}
+    with immediate_tx(conn):
+        se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not se:
+            raise HTTPException(404, detail="会话不存在")
+        if se["status"] != "充电中":
+            raise HTTPException(400, detail=f"会话状态为{se['status']}，不可标超时")
+        open_n = contention._open_inflight_count(conn, session_id)
+        if open_n != 0:
+            raise HTTPException(409, detail=f"仍有{open_n}笔在途脉冲未收口，不可标超时")
+        minutes = int(get_setting(conn, "超时分钟", "120"))
+        ts = now_str()
+        conn.execute(
+            "UPDATE sessions SET status='已超时', note=? WHERE id=?",
+            (f"超过{minutes}分钟未关", session_id),
+        )
+        conn.execute(
+            "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
+            (session_id, "超时", ts, f"阈值{minutes}分钟"),
+        )
+        return {"会话编号": session_id, "状态": "已超时"}
 
 
 def abort_session(conn, session_id: int, reason: str = "急停") -> dict:
-    se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-    if not se:
-        raise HTTPException(404, detail="会话不存在")
-    if se["status"] not in ("充电中", "结算中", "已超时"):
-        raise HTTPException(400, detail=f"会话状态为{se['status']}，不可中断")
-    ts = now_str()
-    conn.execute(
-        "UPDATE sessions SET status='已中断', closed_at=?, note=? WHERE id=?",
-        (ts, reason, session_id),
-    )
-    conn.execute("UPDATE piles SET status='空闲' WHERE id=?", (se["pile_id"],))
-    conn.execute("UPDATE guns SET status='可用' WHERE id=?", (se["gun_id"],))
-    conn.execute(
-        "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
-        (session_id, "异常中断", ts, reason),
-    )
-    return {"会话编号": session_id, "状态": "已中断", "原因": reason}
+    with immediate_tx(conn):
+        se = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not se:
+            raise HTTPException(404, detail="会话不存在")
+        if se["status"] not in ("充电中", "结算中", "已超时"):
+            raise HTTPException(400, detail=f"会话状态为{se['status']}，不可中断")
+        # 口径B：中断也要先让在途登记有着落（超时清扫），避免无主在途
+        contention.sweep_stale_inflight(conn, session_id)
+        open_n = contention._open_inflight_count(conn, session_id)
+        if open_n != 0:
+            raise HTTPException(409, detail=f"仍有{open_n}笔在途脉冲未收口，不可中断")
+        ts = now_str()
+        conn.execute(
+            "UPDATE sessions SET status='已中断', closed_at=?, note=? WHERE id=?",
+            (ts, reason, session_id),
+        )
+        conn.execute("UPDATE piles SET status='空闲' WHERE id=?", (se["pile_id"],))
+        conn.execute("UPDATE guns SET status='可用' WHERE id=?", (se["gun_id"],))
+        conn.execute(
+            "INSERT INTO session_events(session_id,action,created_at,note) VALUES(?,?,?,?)",
+            (session_id, "异常中断", ts, reason),
+        )
+        return {"会话编号": session_id, "状态": "已中断", "原因": reason}
 
 
 def set_pile_status(conn, pile_id: int, status: str) -> dict:

@@ -54,6 +54,16 @@ def overview(conn) -> dict:
         "SELECT COALESCE(SUM(amount),0) AS a FROM sessions WHERE business_day=? AND status='已关账'",
         (today(),),
     ).fetchone()["a"]
+    # 双桶之二：在途脉冲桶。关账完成前若仍有在途，必须如实展示，不得假装零在途。
+    inflight = conn.execute(
+        """SELECT COUNT(*) AS n, COALESCE(SUM(delta_kwh),0) AS k
+           FROM inflight_pulses WHERE status='在途'"""
+    ).fetchone()
+    settling_with_inflight = conn.execute(
+        """SELECT COUNT(*) AS n FROM sessions s
+           WHERE s.status='结算中' AND EXISTS(
+             SELECT 1 FROM inflight_pulses i WHERE i.session_id=s.id AND i.status='在途')"""
+    ).fetchone()["n"]
     return {
         "桩位空闲": pile_map.get("空闲", 0),
         "桩位占用": pile_map.get("占用", 0),
@@ -66,6 +76,10 @@ def overview(conn) -> dict:
         "已中断": sess_map.get("已中断", 0),
         "在充电量": round(float(open_kwh), 3),
         "本日关账金额": round(float(today_amount), 2),
+        "在途脉冲数": inflight["n"],
+        "在途脉冲电量": round(float(inflight["k"]), 3),
+        "结算中带在途会话数": settling_with_inflight,
+        "争用口径": "在途脉冲优先",
         "营业日": today(),
         "充日已封印": is_day_sealed(conn),
     }
@@ -162,4 +176,25 @@ def session_detail(conn, session_id: int):
     d = row_dict(se)
     d["脉冲"] = pulses
     d["事件"] = events
+    d["在途脉冲"] = list_inflight(conn, session_id)
+    d["争用快照"] = list_journal(conn, session_id)
     return d
+
+
+def list_inflight(conn, session_id: int):
+    return rows(
+        conn.execute(
+            "SELECT * FROM inflight_pulses WHERE session_id=? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    )
+
+
+def list_journal(conn, session_id: int):
+    return rows(
+        conn.execute(
+            "SELECT id,generation,phase,snapshot,created_at,replayed_at,note "
+            "FROM contention_journal WHERE session_id=? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    )
